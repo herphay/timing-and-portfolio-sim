@@ -11,13 +11,17 @@ def main() -> None:
     daily_scrapper()
 
 
-def daily_scrapper() -> None:
+def daily_scrapper(
+        benchmark_tickers: list[str] | None = None
+    ) -> None:
     """
     Function to scrape and append all the new daily price data of 
     a pre-defined list of securities that act as benchmarks for 
     certain asset class.
     """
-    benchmark_tickers = [ticker.ticker for ticker in get_index_list()]
+    if not benchmark_tickers:
+        benchmark_tickers = get_all_tickers()
+    # benchmark_tickers = [ticker.ticker for ticker in get_index_list()] # use when adding new stuff
 
     for ticker in benchmark_tickers:
         if ticker_scrapper(ticker):
@@ -36,6 +40,7 @@ def ticker_scrapper(ticker: str) -> bool:
 
     if latest_date[0][0] == None:
         latest_date = None
+        period = 'max'
     else:
         latest_date = (datetime.strptime(latest_date[0][0], '%Y-%m-%d') + 
                     timedelta(days=1)).strftime('%Y-%m-%d')
@@ -43,10 +48,13 @@ def ticker_scrapper(ticker: str) -> bool:
             print(f'{ticker} data has already been updated til {today}, no need to update')
             return False
 
-    new_data = get_ticker_history_yfin(ticker, start=latest_date)
+    if not latest_date:
+        new_data = get_ticker_history_yfin(ticker, period=period)
+    else:
+        new_data = get_ticker_history_yfin(ticker, start=latest_date)
     new_data = new_data.reset_index()
     new_data['Date'] = new_data['Date'].dt.strftime('%Y-%m-%d')
-    time_range = f'{'earliest' if not latest_date else latest_date} to {today} (not incl.)'
+    time_range = f'{new_data['Date'][0] if not latest_date else latest_date} to {today} (not incl.)'
 
     if not (ticker_id := pull_ticker_id(ticker)):
         add_ticker(ticker)
@@ -62,12 +70,14 @@ def ticker_scrapper(ticker: str) -> bool:
     
     # print(list(new_data.itertuples(index=False, name=None)))
 
-    push_ticker_data(list(new_data.itertuples(index=False, name=None)))
-    print(f'Successfully updated database with {time_range} daily price data for ticker: {ticker}')
+    if not push_ticker_data(list(new_data.itertuples(index=False, name=None))):
+        print(f'Data for {ticker} not update, latest data dated: {latest_date}')
+    else:
+        print(f'Successfully updated database with {time_range} daily price data for ticker: {ticker}')
     return True
 
 
-def push_ticker_data(data: list[tuple]) -> None:
+def push_ticker_data(data: list[tuple]) -> bool:
     insertion_sql = """
     INSERT INTO historical_data (ticker_id, date, open, high, low, close,
                                  adj_close, volume, dividend, splits)
@@ -77,8 +87,10 @@ def push_ticker_data(data: list[tuple]) -> None:
     try:
         with con:
             con.executemany(insertion_sql, data)
-    except sqlite3.Error:
-        print('Data insert error')
+        return True
+    except sqlite3.Error as e:
+        print(f'Data insert error: {e}')
+        return False
     finally:
         con.close()
 
@@ -86,6 +98,7 @@ def push_ticker_data(data: list[tuple]) -> None:
 def add_ticker(ticker: str) -> None:
     with sqlite3.connect('historical_data.db') as con:
         con.execute("INSERT INTO tickers (ticker) VALUES (?)", (ticker,))
+    if con: con.close()
     print(f'ticker {ticker} added, please update the other attributes later')
 
 
@@ -93,7 +106,8 @@ def pull_ticker_id(ticker: str) -> int | None:
     with sqlite3.connect('historical_data.db') as con:
         result = con.execute("SELECT ticker_id FROM tickers WHERE ticker = ?", 
                              (ticker,)).fetchone()
-        return result[0] if result is not None else None
+    if con: con.close()
+    return result[0] if result is not None else None
 
 
 def pull_ticker_data(
@@ -125,7 +139,9 @@ def pull_ticker_data(
                         AND date >= ? \
                         AND date <= ? \
                     ", (ticker, start, end))
-        return results.fetchall()
+        results = results.fetchall()
+    if con: con.close()
+    return results
     
 
 def get_ticker_history_yfin(
@@ -207,13 +223,16 @@ def update_db_tickers(tickers: list[TickerInfo]) -> None:
                                  remarks)
                         VALUES (?, ?, ?, ?, ?)
         """, ticker_details)
+    if con: con.close()
 
 
 def get_all_tickers() -> list[str]:
     """Return list of all tickers currently available in the local database"""
     with sqlite3.connect('historical_data.db') as con:
         results = con.execute('SELECT ticker FROM tickers').fetchall()
-        return [tup[0] for tup in results]
+
+    if con: con.close()
+    return [tup[0] for tup in results]
     
 
 def get_all_start_dates(
@@ -233,9 +252,69 @@ def get_all_start_dates(
             results = [('Ticker', 'Earliest data')] + results
             for tup in results:
                 print(f'{tup[0]:17}: {tup[1]}')
-        
-        if get_results:
-            return dict(results)
+
+    if con: con.close()
+
+    if get_results:
+        return dict(results)
+
+
+def delete_ticker_data(
+        tickers: list[str]
+    ) -> None:
+    ticker_ids = [pull_ticker_id(ticker=ticker) for ticker in tickers]
+    with sqlite3.connect('historical_data.db') as con:
+        con.execute('PRAGMA foreign_keys = ON;')
+        for ticker_id, ticker in zip(ticker_ids, tickers):
+            if ticker_id:
+                con.execute(f'DELETE FROM tickers WHERE ticker_id = ?', (ticker_id,))
+                print(f'{ticker} deleted')
+            else:
+                print(f"{ticker} don't exist in the database")
+    if con: con.close()
+
+
+def currency_to_db(
+        ticker: str = 'CNYHKD',
+        source_csv: str = r'/Users/herphaylim/Downloads/CNY_HKD Historical Data.csv',
+    ) -> None:
+    """
+    ONLY FOR USE FOR investing.com Currency data
+    ticker: the FX currency pair, act as ticker name
+    """
+    # Clear the data first
+    delete_ticker_data([ticker])
+
+    new_data = pd.read_csv(source_csv)
+    new_data = new_data[['Date', 'Open', 'High', 'Low', 'Price', 'Vol.']]
+    new_data.columns = ['Date', 'Open', 'High', 'Low', 'Close', 'Volume']
+    new_data['Adj Close'] = new_data['Close']
+    new_data['Dividends'] = 0.0
+    new_data['Stock Splits'] = 0.0
+    new_data['Volume'] = 0.0
+
+    new_data['Date'] = pd.to_datetime(new_data['Date']).dt.strftime('%Y-%m-%d')
+
+    if not (ticker_id := pull_ticker_id(ticker)):
+        add_ticker(ticker)
+        ticker_id = pull_ticker_id(ticker)
+
+    # Add in ticker_id
+    new_data['ticker_id'] = ticker_id
+
+    first_date = new_data['Date'].min()
+    last_date  = new_data['Date'].max()
+
+    # ensure all required columns are persent and in the right order
+    new_data = new_data[['ticker_id', 'Date', 'Open', 'High',  
+                         'Low', 'Close', 'Adj Close', 'Volume',
+                          'Dividends', 'Stock Splits']]
+
+    if not push_ticker_data(list(new_data.itertuples(index=False, name=None))):
+        print(f'Data for {ticker} not update')
+    else:
+        print(f'Successfully updated database with daily prices in range ' + 
+              f'{first_date} to {last_date} for FX pair: {ticker}')
 
 
 if __name__ == '__main__':
